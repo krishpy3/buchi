@@ -3,9 +3,12 @@ from aws_cdk import (
     Aws,
     CfnOutput,
     Duration,
+    SecretValue,
     Stack,
     aws_autoscaling as autoscaling,
     aws_codebuild as cb,
+    aws_codepipeline as codepipeline,
+    aws_codepipeline_actions as codepipeline_actions,
     aws_ecr as ecr,
     aws_ecs as ecs,
     aws_ec2 as ec2,
@@ -20,44 +23,6 @@ class NodeCdkStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
-
-        # # pipeline requires versioned bucket
-        # bucket = s3.Bucket(
-        #     self, "SourceBucket",
-        #     bucket_name=f"Artifact-{Aws.ACCOUNT_ID}",
-        #     versioned=True,
-        # )
-
-        # # ecr repo to push docker container into
-        # ecr = ecr.Repository(
-        #     self, "ECR",
-        #     repository_name='namespace'
-        # )
-
-        # # codebuild project meant to run in pipeline
-        # cb_docker_build = cb.PipelineProject(
-        #     self, "DockerBuild",
-        #     project_name='namespace-Docker-Build',
-        #     build_spec=cb.BuildSpec.from_source_filename(
-        #         filename='pipeline_delivery/docker_build_buildspec.yml'),
-        #     environment=cb.BuildEnvironment(
-        #         privileged=True,
-        #     ),
-        #     # pass the ecr repo uri into the codebuild project so codebuild knows where to push
-        #     environment_variables={
-        #         'ecr': cb.BuildEnvironmentVariable(
-        #             value=ecr.repository_uri),
-        #         'tag': cb.BuildEnvironmentVariable(
-        #             value='cdk')
-        #     },
-        #     description='Pipeline for CodeBuild',
-        #     timeout=Duration.minutes(60),
-        # )
-        # # codebuild iam permissions to read write s3
-        # bucket.grant_read_write(cb_docker_build)
-
-        # # codebuild permissions to interact with ecr
-        # ecr.grant_pull_push(cb_docker_build)
 
         vpc = ec2.Vpc(
             self, "MyVpc",
@@ -144,9 +109,11 @@ class NodeCdkStack(Stack):
             image=ecs.ContainerImage.from_registry(
                 f'{Aws.ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/node_app:latest'
             ),
+            cpu=256,
             memory_limit_mib=256,
             port_mappings=[ecs.PortMapping(
-                container_port=3000, host_port=80)]
+                container_port=3000, host_port=0)],
+            environment={"MYSQL_HOST": "host"}
         )
 
         service = ecs.Ec2Service(self, "Service",
@@ -185,4 +152,123 @@ class NodeCdkStack(Stack):
         CfnOutput(
             self, "LoadBalancerDNS",
             value=lb.load_balancer_dns_name
+        )
+
+        # pipeline requires versioned bucket
+        bucket = s3.Bucket(
+            self, "SourceBucket",
+            bucket_name=f"artifact-{Aws.ACCOUNT_ID}",
+            # versioned=True,
+        )
+
+        repository = ecr.Repository.from_repository_name(
+            self, "NodeRepo", "node_app")
+
+        pipeline = codepipeline.Pipeline(
+            self, "MyPipeline", artifact_bucket=bucket)
+
+        source_output = codepipeline.Artifact()
+        build_output = codepipeline.Artifact()
+
+        source_action = codepipeline_actions.GitHubSourceAction(
+            action_name="Source",
+            owner="krishpy3",
+            repo="sample-nodeApp-ECS",
+            oauth_token=SecretValue.secrets_manager('token'),
+            output=source_output,
+            branch="main"
+        )
+
+        # codebuild project meant to run in pipeline
+        cb_docker_build = cb.PipelineProject(
+            self, "DockerBuild",
+            project_name='Docker-Build-Project',
+            # build_spec=cb.BuildSpec.from_source_filename(
+            #     filename='docker_build_buildspec.yml'),
+            build_spec=cb.BuildSpec.from_object({
+                "version": 0.2,
+                "run-as": "root",
+                "phases": {
+                    "pre_build": {
+                        "commands": [
+                            "echo Logging in to Amazon ECR...",
+                            "aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com",
+                            "REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$IMAGE_REPO_NAME"
+                        ]
+                    },
+                    "build": {
+                        "commands": [
+                            "echo Build started on `date`",
+                            "echo Building the Docker image...",
+                            "docker build -t $IMAGE_REPO_NAME:latest .",
+                            "docker tag $IMAGE_REPO_NAME:latest $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$IMAGE_REPO_NAME:latest"
+                        ]
+                    },
+                    "post_build": {
+                        "commands": [
+                            "echo Build completed on `date`",
+                            "echo Pushing the Docker image...",
+                            "docker push $AWS_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/$IMAGE_REPO_NAME:latest",
+                            "echo Writing image definitions file...",
+                            "printf '[{\"name\":\"%s\",\"imageUri\":\"%s\"}]' $CONTAINER_NAME $REPOSITORY_URI:latest > imagedefinitions.json"
+                        ]
+                    }
+                },
+                "artifacts": {
+                    "files": "imagedefinitions.json"
+                }
+            }),
+            environment=cb.BuildEnvironment(
+                privileged=True,
+            ),
+            # pass the ecr repo uri into the codebuild project so codebuild knows where to push
+            environment_variables={
+                'AWS_ACCOUNT_ID': cb.BuildEnvironmentVariable(
+                    value=Aws.ACCOUNT_ID),
+                'IMAGE_REPO_NAME': cb.BuildEnvironmentVariable(
+                    value='node_app'),
+                'CONTAINER_NAME': cb.BuildEnvironmentVariable(
+                    value='TheContainer'),
+            },
+            description='Pipeline for CodeBuild',
+            timeout=Duration.minutes(60),
+        )
+        # codebuild iam permissions to read write s3
+        bucket.grant_read_write(cb_docker_build)
+
+        repository.grant_pull_push(cb_docker_build)
+
+        build_action = codepipeline_actions.CodeBuildAction(
+            action_name="CodeBuild",
+            project=cb_docker_build,
+            input=source_output,
+            outputs=[build_output]
+            # execute_batch_build=True,  # optional, defaults to false
+            # combine_batch_build_artifacts=True
+        )
+
+        pipeline.add_stage(
+            stage_name="Source",
+            actions=[source_action]
+        )
+
+        pipeline.add_stage(
+            stage_name="Build",
+            actions=[build_action]
+        )
+
+        deploy_action = codepipeline_actions.EcsDeployAction(
+            action_name="DeployAction",
+            service=service,
+            input=build_output,
+            # if your file name is _not_ imagedefinitions.json,
+            # use the `imageFile` property,
+            # and leave out the `input` property
+            # image_file=build_output.at_path("imageDef.json"),
+            deployment_timeout=Duration.minutes(60)
+        )
+
+        pipeline.add_stage(
+            stage_name="Deploy",
+            actions=[deploy_action]
         )
